@@ -3,6 +3,7 @@
 // variable in order to cache the compiled artifacts and avoid recompiling too often.
 use anyhow::{Context, Result};
 use rayon::prelude::*;
+use std::env;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -95,8 +96,15 @@ fn main() -> Result<()> {
                     .arg("-U__CUDA_NO_BFLOAT162_CONVERSIONS__")
                     .arg(format!("--gpu-architecture=sm_{compute_cap}"))
                     .arg("-c")
-                    .arg("--compiler-options")
-                    .arg("-fPIC,/bigobj")
+                    .arg("--compiler-options");
+                
+                // msvc tools require /bigobj
+                if env::var("TARGET") == Ok("x86_64-pc-windows-msvc".to_string()) {
+                    command.arg("-fPIC,/bigobj");
+                } else {
+                    command.arg("-fPIC");
+                }
+                command
                     .args(["-o", obj_file.to_str().unwrap()])
                     .args(["--default-stream", "per-thread"])
                     .arg("--expt-relaxed-constexpr")
