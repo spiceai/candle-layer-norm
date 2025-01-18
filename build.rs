@@ -96,7 +96,7 @@ fn main() -> Result<()> {
                     .arg(format!("--gpu-architecture=sm_{compute_cap}"))
                     .arg("-c")
                     .arg("--compiler-options")
-                    .arg("-fPIC")
+                    .arg("-fPIC,/bigobj")
                     .args(["-o", obj_file.to_str().unwrap()])
                     .args(["--default-stream", "per-thread"])
                     .arg("--expt-relaxed-constexpr")
