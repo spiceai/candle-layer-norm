@@ -102,7 +102,7 @@ fn main() -> Result<()> {
                 
                 // msvc tools require /bigobj
                 if target.contains("msvc") {
-                    command.arg("-fPIC,/bigobj");
+                    command.arg("/bigobj");
                 } else {
                     command.arg("-fPIC");
                 }
