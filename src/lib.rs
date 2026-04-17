@@ -3,7 +3,6 @@ mod ffi;
 use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
-use candle::cuda_backend::WrapErr;
 use candle::{CpuStorage, DType, Layout, Result, Shape, Storage, Tensor};
 use half::{bf16, f16};
 use std::ptr;
@@ -95,6 +94,11 @@ impl LayerNorm {
 
         let is_rms_norm = if self.is_rms_norm { 1 } else { 0 };
 
+        // cudarc 0.19: device pointers are obtained via `device_ptr(stream)`
+        // and returned together with a lifetime guard. Hold the stream once
+        // for the whole FFI call.
+        let stream = dev.cuda_stream();
+
         // If beta is et, get ids device pointer
         let b_ptr = if let Some(beta) = &self.beta {
             // Make sure that beta is a CUDA tensor and get the underlying storage
@@ -113,7 +117,10 @@ impl LayerNorm {
             if b_stride[b_rank - 1] != 1 {
                 candle::bail!("the last dim of b must be contiguous {b_stride:?}")
             }
-            *b.device_ptr() as *const core::ffi::c_void
+            let (ptr_v, guard) = b.device_ptr(&stream);
+            // Keep pointer alive for the FFI call duration via the guards below.
+            drop(guard);
+            ptr_v as *const core::ffi::c_void
         } else {
             ptr::null() as *const std::ffi::c_void
         };
@@ -139,7 +146,9 @@ impl LayerNorm {
             if r_stride[r_rank - 1] != 1 {
                 candle::bail!("the last dim of r must be contiguous {r_stride:?}")
             }
-            *r.device_ptr() as *const std::ffi::c_void
+            let (ptr_v, guard) = r.device_ptr(&stream);
+            drop(guard);
+            ptr_v as *const std::ffi::c_void
         } else {
             ptr::null() as *const std::ffi::c_void
         };
@@ -148,23 +157,31 @@ impl LayerNorm {
         // so out has the same shape as inp * 2
         let out_shape = Shape::from((rows * 2, cols));
 
-        let out = unsafe { dev.alloc::<T>(out_shape.elem_count()) }.w()?;
-        let dst = out.slice(..rows * cols);
-        let dst_add = out.slice(rows * cols..);
+        let out = unsafe { dev.alloc::<T>(out_shape.elem_count()) }?;
 
         // Alloc internal buffers
-        let mu = unsafe { dev.alloc::<f32>(rows) }.w()?;
-        let rsigma = unsafe { dev.alloc::<f32>(rows) }.w()?;
+        let mu = unsafe { dev.alloc::<f32>(rows) }?;
+        let rsigma = unsafe { dev.alloc::<f32>(rows) }?;
 
-        // Get cuda device pointers from cuda slices
-        let x_ptr = *x.device_ptr() as *const core::ffi::c_void;
-        let g_ptr = *g.device_ptr() as *const core::ffi::c_void;
-        let dst_add_ptr = *dst_add.device_ptr() as *const core::ffi::c_void;
-        let dst_ptr = *dst.device_ptr() as *const core::ffi::c_void;
-        let mu_ptr = *mu.device_ptr() as *const core::ffi::c_void;
-        let rsigma_ptr = *rsigma.device_ptr() as *const core::ffi::c_void;
+        // Get cuda device pointers from cuda slices. cudarc 0.19's `slice(..)`
+        // returns a borrowing `CudaView`, so we compute dst / dst_add pointers
+        // by adding byte offsets to the base pointer of `out`. This keeps `out`
+        // owned so it can be wrapped into a CudaStorage at the end.
+        let (x_ptr, _x_g) = x.device_ptr(&stream);
+        let (g_ptr, _g_g) = g.device_ptr(&stream);
+        let (out_ptr, _out_g) = out.device_ptr(&stream);
+        let (mu_ptr, _mu_g) = mu.device_ptr(&stream);
+        let (rsigma_ptr, _rs_g) = rsigma.device_ptr(&stream);
+        let x_ptr = x_ptr as *const core::ffi::c_void;
+        let g_ptr = g_ptr as *const core::ffi::c_void;
+        let dst_ptr = out_ptr as *const core::ffi::c_void;
+        let dst_add_ptr =
+            (out_ptr + (rows * cols * std::mem::size_of::<T>()) as u64) as *const core::ffi::c_void;
+        let mu_ptr = mu_ptr as *const core::ffi::c_void;
+        let rsigma_ptr = rsigma_ptr as *const core::ffi::c_void;
 
-        let multi_processors_count = dev
+        let multi_processors_count = stream
+            .context()
             .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
             .unwrap();
 
@@ -192,6 +209,14 @@ impl LayerNorm {
                 is_rms_norm,
             )
         }
+
+        // Drop the lifetime guards on out/mu/rsigma before we take ownership of
+        // `out` for wrap_cuda_slice.
+        drop(_out_g);
+        drop(_mu_g);
+        drop(_rs_g);
+        drop(_x_g);
+        drop(_g_g);
 
         let out = candle::CudaStorage::wrap_cuda_slice(out, dev.clone());
 
